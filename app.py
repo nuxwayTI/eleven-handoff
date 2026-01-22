@@ -9,7 +9,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 # -----------------------------
-# Logging (Render Logs)
+# Logging (shows in Render Logs)
 # -----------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("eleven-handoff")
@@ -17,8 +17,8 @@ logger = logging.getLogger("eleven-handoff")
 # -----------------------------
 # ENV VARS
 # -----------------------------
-ELEVEN_SHARED_SECRET = os.getenv("ELEVEN_SHARED_SECRET")  # optional; protects endpoints if set
-DRY_RUN = os.getenv("DRY_RUN", "0") == "1"  # if 1 -> no real calls
+ELEVEN_SHARED_SECRET = os.getenv("ELEVEN_SHARED_SECRET")  # optional
+DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 PBX_DOMAIN = os.getenv("PBX_DOMAIN")  # e.g. nuxwaytechnology.use.ycmcloud.com
 YEASTAR_API_PATH = os.getenv("YEASTAR_API_PATH", "openapi/v1.0")
@@ -27,9 +27,13 @@ YEASTAR_USER_AGENT = os.getenv("YEASTAR_USER_AGENT", "OpenAPI")  # REQUIRED by Y
 YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")  # Client ID
 YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")  # Client Secret
 
-DEFAULT_CALLER = os.getenv("DEFAULT_CALLER", "")  # e.g. "4002"
-DEFAULT_DIAL_PERMISSION = os.getenv("DEFAULT_DIAL_PERMISSION")  # optional
-DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")  # yes/no
+# NEW: Control variables (as you requested)
+CALLER = os.getenv("CALLER", "6200")               # e.g. IVR 6200
+CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")   # outbound prefix
+DIAL_PERMISSION = os.getenv("DIAL_PERMISSION", "4002")  # permission extension
+
+# We keep auto_answer default as "no" for IVR/Queue flows
+DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")
 
 
 def _require_env(name: str, value: Optional[str]) -> str:
@@ -38,21 +42,40 @@ def _require_env(name: str, value: Optional[str]) -> str:
     return value
 
 
-def normalize_phone(value: str) -> str:
+def normalize_digits(value: str) -> str:
     """
     Accept:
-      - +59170123456
-      - 59170123456
-      - 59170123456@c.us
-      - 59170123456@s.whatsapp.net
+      - +59170770144
+      - 59170770144
+      - 70770144
+      - 70770144@c.us
+    Returns only digits.
     """
     value = (value or "").strip()
     value = value.replace("@c.us", "").replace("@s.whatsapp.net", "")
-    if value.startswith("+"):
-        return "+" + re.sub(r"\D", "", value)
     return re.sub(r"\D", "", value)
 
 
+def build_callee(number: str) -> str:
+    """
+    Ensures number starts with CALLEE_PREFIX (e.g. 98).
+    If already starts with 98, keep it.
+    """
+    digits = normalize_digits(number)
+    prefix = normalize_digits(CALLEE_PREFIX)
+
+    if not digits:
+        return ""
+
+    if prefix and digits.startswith(prefix):
+        return digits
+
+    return f"{prefix}{digits}" if prefix else digits
+
+
+# -----------------------------
+# Yeastar API Client
+# -----------------------------
 class YeastarClient:
     def __init__(self) -> None:
         self._token: Optional[str] = None
@@ -68,6 +91,10 @@ class YeastarClient:
         return f"{self.base_url}/{YEASTAR_API_PATH}"
 
     async def get_token(self) -> str:
+        """
+        POST /openapi/v1.0/get_token
+        Headers MUST include: User-Agent: OpenAPI
+        """
         url = f"{self.api_base}/get_token"
         headers = {
             "Content-Type": "application/json",
@@ -105,9 +132,13 @@ class YeastarClient:
         self,
         caller: str,
         callee: str,
-        dial_permission: Optional[str] = None,
-        auto_answer: str = "no",
+        dial_permission: Optional[str],
+        auto_answer: str,
     ) -> Dict[str, Any]:
+        """
+        POST /openapi/v1.0/call/dial?access_token=...
+        JSON body: caller, callee, dial_permission, auto_answer
+        """
         token = await self.access_token()
 
         url = f"{self.api_base}/call/dial"
@@ -123,7 +154,7 @@ class YeastarClient:
         if auto_answer:
             payload["auto_answer"] = auto_answer
 
-        logger.info("Calling Yeastar /call/dial ...")
+        logger.info(f"Calling Yeastar /call/dial payload={payload}")
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(url, headers=headers, params=params, json=payload)
             r.raise_for_status()
@@ -134,29 +165,42 @@ yeastar = YeastarClient()
 app = FastAPI(title="eleven-handoff")
 
 
+# -----------------------------
+# Payload from ElevenLabs Tool
+# -----------------------------
 class HandoffPayload(BaseModel):
-    whatsapp_id: str = Field(..., description="User WhatsApp ID/number (E.164 or wa_id).")
-    confirmed: bool = Field(..., description="True only after user confirms talking to a human.")
-    reason: Optional[str] = Field(None, description="Optional context (for logs).")
-    caller: Optional[str] = Field(None, description="Extension/Caller. If not provided uses DEFAULT_CALLER.")
-    dial_permission: Optional[str] = Field(None, description="Optional if caller lacks outbound permission.")
-    auto_answer: Optional[str] = Field(None, description="yes/no. If not provided uses DEFAULT_AUTO_ANSWER.")
+    whatsapp_id: str = Field(..., description="User number/whatsapp id. We will prefix it with CALLEE_PREFIX.")
+    confirmed: bool = Field(..., description="True only after user confirms.")
+    reason: Optional[str] = Field(None, description="Optional context for logs.")
+
+    # Optional overrides per-request (if needed later)
+    caller: Optional[str] = Field(None, description="Overrides env CALLER.")
+    callee_prefix: Optional[str] = Field(None, description="Overrides env CALLEE_PREFIX.")
+    dial_permission: Optional[str] = Field(None, description="Overrides env DIAL_PERMISSION.")
+    auto_answer: Optional[str] = Field(None, description="yes/no. For IVR/Queue usually 'no'.")
 
 
 @app.get("/health")
 async def health():
     logger.info("Health check hit.")
-    return {"ok": True, "service": "eleven-handoff", "dry_run": DRY_RUN}
+    return {
+        "ok": True,
+        "service": "eleven-handoff",
+        "dry_run": DRY_RUN,
+        "caller": CALLER,
+        "callee_prefix": CALLEE_PREFIX,
+        "dial_permission": DIAL_PERMISSION,
+    }
 
 
 @app.get("/yeastar/ping")
 async def yeastar_ping(x_admin_key: Optional[str] = Header(default=None)):
     """
-    Safe test: verifies Yeastar connectivity by obtaining token (no call).
-    Protect it with ELEVEN_SHARED_SECRET using header X-Admin-Key.
+    Safe connectivity test: obtains token only (no call).
+    If ELEVEN_SHARED_SECRET is set, protect with header X-Admin-Key.
     """
     if ELEVEN_SHARED_SECRET:
-        if not x_admin_key or x_admin_key != ELEVEN_SHARED_SECRET:
+        if x_admin_key != ELEVEN_SHARED_SECRET:
             raise HTTPException(status_code=401, detail="Invalid admin key")
 
     try:
@@ -172,31 +216,41 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     logger.info(">>> /tools/handoff_to_human HIT")
     logger.info(f"DRY_RUN={DRY_RUN}")
     logger.info(f"Headers: X-Eleven-Secret present={bool(x_eleven_secret)}")
+    logger.info(f"Payload received: {payload.model_dump()}")
 
-    # Optional security for Eleven webhook
+    # Optional security
     if ELEVEN_SHARED_SECRET:
-        if not x_eleven_secret or x_eleven_secret != ELEVEN_SHARED_SECRET:
+        if x_eleven_secret != ELEVEN_SHARED_SECRET:
             logger.warning("Invalid secret provided.")
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    logger.info(f"Payload received: {payload.model_dump()}")
-
     if not payload.confirmed:
-        logger.info("User not confirmed yet -> ignoring.")
         return {"status": "ignored", "reason": "User not confirmed yet"}
 
-    caller = payload.caller or DEFAULT_CALLER
+    # Resolve config (env + optional request overrides)
+    caller = (payload.caller or CALLER).strip()
+    dial_permission = (payload.dial_permission or DIAL_PERMISSION).strip() if (payload.dial_permission or DIAL_PERMISSION) else None
+
+    # allow overriding prefix in request if you ever want
+    effective_prefix = payload.callee_prefix or CALLEE_PREFIX
+    global CALLEE_PREFIX  # used by build_callee
+    old_prefix = CALLEE_PREFIX
+    CALLEE_PREFIX = effective_prefix
+
+    try:
+        callee = build_callee(payload.whatsapp_id)
+    finally:
+        CALLEE_PREFIX = old_prefix  # restore
+
     if not caller:
-        raise HTTPException(status_code=500, detail="DEFAULT_CALLER not set and caller not provided")
+        raise HTTPException(status_code=500, detail="CALLER env var not set (and no caller provided).")
 
-    callee = normalize_phone(payload.whatsapp_id)
     if not callee:
-        raise HTTPException(status_code=400, detail="Invalid whatsapp_id")
+        raise HTTPException(status_code=400, detail="Invalid whatsapp_id / could not build callee")
 
-    dial_permission = payload.dial_permission or DEFAULT_DIAL_PERMISSION
-    auto_answer = payload.auto_answer or DEFAULT_AUTO_ANSWER
+    auto_answer = (payload.auto_answer or DEFAULT_AUTO_ANSWER).strip()
 
-    logger.info(f"Preparing call: caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer}")
+    logger.info(f"Prepared call -> caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer}")
 
     if DRY_RUN:
         logger.info("DRY_RUN=1 -> Not calling Yeastar. Returning simulated OK.")
@@ -231,4 +285,3 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
         raise HTTPException(status_code=502, detail={"yeastar": res})
 
     return {"status": "ok", "call_id": res.get("call_id"), "yeastar": res}
-
