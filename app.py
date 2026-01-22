@@ -28,11 +28,17 @@ YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")
 YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")
 
 # Control variables
-CALLER = os.getenv("CALLER", "6200")               # IVR 6200
-CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")   # outbound prefix 98
-DIAL_PERMISSION = os.getenv("DIAL_PERMISSION", "4002")  # permission extension 4002
+CALLER = os.getenv("CALLER", "6200")               # IVR 6200 or queue/ivr entry
+CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")   # outbound prefix (your PBX)
+DIAL_PERMISSION = os.getenv("DIAL_PERMISSION", "4002")  # permission extension
 
 DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")  # keep 'no' for IVR/Queue flow
+
+# NEW (global country-code stripping):
+# If STRIP_COUNTRY_CODE=1, we will keep ONLY the last LOCAL_NUMBER_LEN digits.
+# Example: 59161786583 -> last 8 digits -> 61786583
+STRIP_COUNTRY_CODE = os.getenv("STRIP_COUNTRY_CODE", "1") == "1"
+LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))  # Bolivia local is usually 8
 
 
 def _require_env(name: str, value: Optional[str]) -> str:
@@ -42,22 +48,61 @@ def _require_env(name: str, value: Optional[str]) -> str:
 
 
 def normalize_digits(value: str) -> str:
+    """
+    Accept:
+      - +59161786583
+      - 59161786583
+      - 61786583
+      - 61786583@c.us
+    Returns only digits.
+    """
     value = (value or "").strip()
     value = value.replace("@c.us", "").replace("@s.whatsapp.net", "")
     return re.sub(r"\D", "", value)
 
 
+def to_local_digits(digits: str) -> str:
+    """
+    Global approach:
+    If STRIP_COUNTRY_CODE is enabled and digits is longer than LOCAL_NUMBER_LEN,
+    keep the last LOCAL_NUMBER_LEN digits.
+
+    This works for most cases when your PBX dial plan expects a fixed local length.
+    """
+    if not digits:
+        return ""
+    if STRIP_COUNTRY_CODE and LOCAL_NUMBER_LEN > 0 and len(digits) > LOCAL_NUMBER_LEN:
+        return digits[-LOCAL_NUMBER_LEN:]
+    return digits
+
+
 def build_callee(number: str) -> str:
+    """
+    Build final PBX dial string:
+      - normalize to digits
+      - convert to local digits (strip country code by taking last N)
+      - add CALLEE_PREFIX (98) unless already present
+    """
     digits = normalize_digits(number)
     prefix = normalize_digits(CALLEE_PREFIX)
 
     if not digits:
         return ""
 
-    if prefix and digits.startswith(prefix):
-        return digits
+    # If the incoming number already contains the PBX prefix, remove it temporarily,
+    # then re-apply it at the end (avoid weird double prefix cases).
+    if prefix and digits.startswith(prefix) and len(digits) > len(prefix):
+        digits_wo_prefix = digits[len(prefix):]
+    else:
+        digits_wo_prefix = digits
 
-    return f"{prefix}{digits}" if prefix else digits
+    local_digits = to_local_digits(digits_wo_prefix)
+    if not local_digits:
+        return ""
+
+    if prefix:
+        return f"{prefix}{local_digits}"
+    return local_digits
 
 
 class YeastarClient:
@@ -142,10 +187,10 @@ app = FastAPI(title="eleven-handoff")
 
 
 # -----------------------------
-# Payload: tolerant to avoid 422
+# Payload (tolerant to avoid 422)
 # -----------------------------
 class HandoffPayload(BaseModel):
-    whatsapp_id: Optional[str] = Field(None, description="User number/whatsapp id")
+    whatsapp_id: Optional[str] = Field(None, description="WhatsApp user id / phone number")
     confirmed: Optional[bool] = Field(None, description="True after user confirms")
     reason: Optional[str] = Field(None, description="Optional context.")
 
@@ -164,6 +209,8 @@ async def health():
         "caller": CALLER,
         "callee_prefix": CALLEE_PREFIX,
         "dial_permission": DIAL_PERMISSION,
+        "strip_country_code": STRIP_COUNTRY_CODE,
+        "local_number_len": LOCAL_NUMBER_LEN,
     }
 
 
@@ -203,9 +250,12 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
         return {"status": "ignored", "reason": "CALLER not set"}
 
     if not callee:
-        return {"status": "ignored", "reason": "invalid whatsapp_id"}
+        return {"status": "ignored", "reason": "invalid whatsapp_id after normalization"}
 
-    logger.info(f"Prepared call -> caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer}")
+    logger.info(
+        f"Prepared call -> caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer} "
+        f"(strip_country_code={STRIP_COUNTRY_CODE}, local_len={LOCAL_NUMBER_LEN})"
+    )
 
     if DRY_RUN:
         return {
