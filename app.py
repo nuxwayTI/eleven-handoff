@@ -22,12 +22,12 @@ DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
 
 PBX_DOMAIN = os.getenv("PBX_DOMAIN")  # e.g. nuxwaytechnology.use.ycmcloud.com
 YEASTAR_API_PATH = os.getenv("YEASTAR_API_PATH", "openapi/v1.0")
-YEASTAR_USER_AGENT = os.getenv("YEASTAR_USER_AGENT", "OpenAPI")  # required by Yeastar
+YEASTAR_USER_AGENT = os.getenv("YEASTAR_USER_AGENT", "OpenAPI")
 
 YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")
 YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")
 
-# Your requested control vars:
+# Control variables
 CALLER = os.getenv("CALLER", "6200")               # IVR 6200
 CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")   # outbound prefix 98
 DIAL_PERMISSION = os.getenv("DIAL_PERMISSION", "4002")  # permission extension 4002
@@ -141,9 +141,12 @@ yeastar = YeastarClient()
 app = FastAPI(title="eleven-handoff")
 
 
+# -----------------------------
+# Payload: tolerant to avoid 422
+# -----------------------------
 class HandoffPayload(BaseModel):
-    whatsapp_id: str = Field(..., description="User number/whatsapp id; server prefixes with CALLEE_PREFIX.")
-    confirmed: bool = Field(..., description="True after user confirms.")
+    whatsapp_id: Optional[str] = Field(None, description="User number/whatsapp id")
+    confirmed: Optional[bool] = Field(None, description="True after user confirms")
     reason: Optional[str] = Field(None, description="Optional context.")
 
     # Optional overrides per request
@@ -179,11 +182,16 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     logger.info(f"DRY_RUN={DRY_RUN}")
     logger.info(f"Payload received: {payload.model_dump()}")
 
+    # Optional security
     if ELEVEN_SHARED_SECRET and x_eleven_secret != ELEVEN_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    if not payload.confirmed:
-        return {"status": "ignored", "reason": "User not confirmed yet"}
+    # Tolerant: avoid 422 if ElevenLabs sends partial requests
+    if payload.confirmed is not True:
+        return {"status": "ignored", "reason": "confirmed is not true"}
+
+    if not payload.whatsapp_id:
+        return {"status": "ignored", "reason": "missing whatsapp_id"}
 
     caller = (payload.caller or CALLER).strip()
     dial_permission = (payload.dial_permission or DIAL_PERMISSION).strip() if (payload.dial_permission or DIAL_PERMISSION) else None
@@ -192,9 +200,10 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     callee = build_callee(payload.whatsapp_id)
 
     if not caller:
-        raise HTTPException(status_code=500, detail="CALLER not set")
+        return {"status": "ignored", "reason": "CALLER not set"}
+
     if not callee:
-        raise HTTPException(status_code=400, detail="Invalid whatsapp_id")
+        return {"status": "ignored", "reason": "invalid whatsapp_id"}
 
     logger.info(f"Prepared call -> caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer}")
 
@@ -221,3 +230,4 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
         raise HTTPException(status_code=502, detail={"yeastar": res})
 
     return {"status": "ok", "call_id": res.get("call_id"), "yeastar": res}
+
