@@ -1,29 +1,42 @@
 import os
 import time
 import re
+import logging
 from typing import Optional, Any, Dict
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+# -----------------------------
+# Logging (shows in Render Logs)
+# -----------------------------
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("eleven-handoff")
 
 # -----------------------------
-# ENV VARS (Heroku/Render/etc.)
+# ENV VARS (Render/Heroku/etc.)
 # -----------------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-ELEVEN_SHARED_SECRET = os.getenv("ELEVEN_SHARED_SECRET")  # opcional
+# Optional shared secret to protect the webhook endpoint
+ELEVEN_SHARED_SECRET = os.getenv("ELEVEN_SHARED_SECRET")  # if set, require header X-Eleven-Secret
 
-PBX_DOMAIN = os.getenv("PBX_DOMAIN")  # ej: tu-dominio.yeastarcloud.com
+# DRY RUN: if DRY_RUN=1, do NOT call Yeastar; only log & return "would_call"
+DRY_RUN = os.getenv("DRY_RUN", "0") == "1"
+
+# Yeastar (P-Series Cloud Edition)
+PBX_DOMAIN = os.getenv("PBX_DOMAIN")  # e.g. nuxwaytechnology.use.ycmcloud.com
 YEASTAR_API_PATH = os.getenv("YEASTAR_API_PATH", "openapi/v1.0")
-YEASTAR_USER_AGENT = os.getenv("YEASTAR_USER_AGENT", "OpenAPI")  # requerido por Yeastar
+YEASTAR_USER_AGENT = os.getenv("YEASTAR_USER_AGENT", "OpenAPI")  # REQUIRED by Yeastar
 
-YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")  # Client ID
-YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")  # Client Secret
+# Integrations > API (Client ID/Secret)
+YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")
+YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")
 
-DEFAULT_CALLER = os.getenv("DEFAULT_CALLER", "")  # ej: "100"
-DEFAULT_DIAL_PERMISSION = os.getenv("DEFAULT_DIAL_PERMISSION")  # opcional
+# Call defaults
+DEFAULT_CALLER = os.getenv("DEFAULT_CALLER", "")  # e.g. "4002"
+DEFAULT_DIAL_PERMISSION = os.getenv("DEFAULT_DIAL_PERMISSION")  # optional
 DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")  # yes/no
 
 
@@ -38,14 +51,17 @@ def _require_env(name: str, value: Optional[str]) -> str:
 # -----------------------------
 def normalize_phone(value: str) -> str:
     """
-    WhatsApp ID puede venir como:
+    WhatsApp ID can come as:
       - +59170123456
       - 59170123456
       - 59170123456@c.us
-    Dejamos solo dígitos y + inicial si existe.
+      - 59170123456@s.whatsapp.net
+
+    Keep only digits and optional leading +.
     """
-    value = value.strip()
+    value = (value or "").strip()
     value = value.replace("@c.us", "").replace("@s.whatsapp.net", "")
+
     if value.startswith("+"):
         return "+" + re.sub(r"\D", "", value)
     return re.sub(r"\D", "", value)
@@ -69,7 +85,10 @@ class YeastarClient:
         return f"{self.base_url}/{YEASTAR_API_PATH}"
 
     async def get_token(self) -> str:
-        # token endpoint: POST /openapi/v1.0/get_token
+        """
+        POST /openapi/v1.0/get_token
+        Headers MUST include: User-Agent: OpenAPI
+        """
         url = f"{self.api_base}/get_token"
         headers = {
             "Content-Type": "application/json",
@@ -80,6 +99,7 @@ class YeastarClient:
             "password": _require_env("YEASTAR_PASSWORD", YEASTAR_PASSWORD),
         }
 
+        logger.info("Requesting Yeastar access token...")
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(url, headers=headers, json=payload)
             r.raise_for_status()
@@ -90,8 +110,12 @@ class YeastarClient:
 
         token = data["access_token"]
         expires_in = int(data.get("access_token_expire_time", 1800))
+
+        # Refresh a bit early
         self._token = token
-        self._token_expiry = time.time() + max(0, expires_in - 30)  # refresh early
+        self._token_expiry = time.time() + max(0, expires_in - 30)
+
+        logger.info(f"Yeastar token OK. Expires in ~{expires_in}s")
         return token
 
     async def access_token(self) -> str:
@@ -99,7 +123,17 @@ class YeastarClient:
             return self._token
         return await self.get_token()
 
-    async def dial(self, caller: str, callee: str, dial_permission: Optional[str], auto_answer: str) -> Dict[str, Any]:
+    async def dial(
+        self,
+        caller: str,
+        callee: str,
+        dial_permission: Optional[str] = None,
+        auto_answer: str = "no",
+    ) -> Dict[str, Any]:
+        """
+        POST /openapi/v1.0/call/dial?access_token=...
+        JSON body: caller, callee, optional dial_permission, auto_answer
+        """
         token = await self.access_token()
 
         url = f"{self.api_base}/call/dial"
@@ -115,6 +149,7 @@ class YeastarClient:
         if auto_answer:
             payload["auto_answer"] = auto_answer
 
+        logger.info("Calling Yeastar /call/dial ...")
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post(url, headers=headers, params=params, json=payload)
             r.raise_for_status()
@@ -126,30 +161,42 @@ app = FastAPI(title="eleven-handoff")
 
 
 # -----------------------------
-# Payload que manda ElevenLabs
+# Payload expected from ElevenLabs Tool
 # -----------------------------
 class HandoffPayload(BaseModel):
-    whatsapp_id: str = Field(..., description="Número/ID del usuario (ideal E.164 o wa_id).")
-    confirmed: bool = Field(..., description="True si el usuario confirmó hablar con humano.")
-    caller: Optional[str] = Field(None, description="Extensión/Caller. Si no, usa DEFAULT_CALLER.")
-    dial_permission: Optional[str] = Field(None, description="Opcional si caller no tiene permisos.")
-    auto_answer: Optional[str] = Field(None, description="yes/no. Si no, usa DEFAULT_AUTO_ANSWER.")
+    whatsapp_id: str = Field(..., description="User WhatsApp ID/number (E.164 or wa_id).")
+    confirmed: bool = Field(..., description="True only after user confirms talking to a human.")
+    reason: Optional[str] = Field(None, description="Optional reason for handoff (logging/useful context).")
+
+    caller: Optional[str] = Field(None, description="Extension/Caller. If not provided uses DEFAULT_CALLER.")
+    dial_permission: Optional[str] = Field(None, description="Optional if caller lacks outbound permission.")
+    auto_answer: Optional[str] = Field(None, description="yes/no. If not provided uses DEFAULT_AUTO_ANSWER.")
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    logger.info("Health check hit.")
+    return {"ok": True, "service": "eleven-handoff", "dry_run": DRY_RUN}
 
 
 @app.post("/tools/handoff_to_human")
 async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[str] = Header(default=None)):
-    # Seguridad opcional
+    logger.info(">>> /tools/handoff_to_human HIT")
+    logger.info(f"DRY_RUN={DRY_RUN}")
+    logger.info(f"Headers: X-Eleven-Secret present={bool(x_eleven_secret)}")
+
+    # Optional security
     if ELEVEN_SHARED_SECRET:
         if not x_eleven_secret or x_eleven_secret != ELEVEN_SHARED_SECRET:
+            logger.warning("Invalid secret provided.")
             raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # Debe venir confirmado (tu agente pregunta primero)
+    # Log payload
+    logger.info(f"Payload received: {payload.model_dump()}")
+
+    # Must be confirmed by user
     if not payload.confirmed:
+        logger.info("User not confirmed yet -> ignoring.")
         return {"status": "ignored", "reason": "User not confirmed yet"}
 
     caller = payload.caller or DEFAULT_CALLER
@@ -163,6 +210,25 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     dial_permission = payload.dial_permission or DEFAULT_DIAL_PERMISSION
     auto_answer = payload.auto_answer or DEFAULT_AUTO_ANSWER
 
+    logger.info(
+        f"Preparing call: caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer}"
+    )
+
+    # DRY RUN (no real call)
+    if DRY_RUN:
+        logger.info("DRY_RUN=1 -> Not calling Yeastar. Returning simulated OK.")
+        return {
+            "status": "dry_run_ok",
+            "would_call": {
+                "caller": caller,
+                "callee": callee,
+                "dial_permission": dial_permission,
+                "auto_answer": auto_answer,
+                "reason": payload.reason,
+            },
+        }
+
+    # Real call to Yeastar
     try:
         res = await yeastar.dial(
             caller=caller,
@@ -170,12 +236,16 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
             dial_permission=dial_permission,
             auto_answer=auto_answer,
         )
+        logger.info(f"Yeastar response: {res}")
     except httpx.HTTPError as e:
+        logger.exception("HTTP error calling Yeastar")
         raise HTTPException(status_code=502, detail=f"HTTP error calling Yeastar: {str(e)}")
     except Exception as e:
+        logger.exception("Unexpected error calling Yeastar")
         raise HTTPException(status_code=502, detail=f"Error calling Yeastar: {str(e)}")
 
     if res.get("errcode") != 0:
+        logger.error(f"Yeastar returned errcode != 0: {res}")
         raise HTTPException(status_code=502, detail={"yeastar": res})
 
     return {"status": "ok", "call_id": res.get("call_id"), "yeastar": res}
