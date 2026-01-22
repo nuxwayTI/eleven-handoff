@@ -1,91 +1,182 @@
 import os
-import logging
-from flask import Flask, request, jsonify, Response
-from twilio.rest import Client
-from twilio.twiml.voice_response import VoiceResponse
+import time
+import re
+from typing import Optional, Any, Dict
 
-logging.basicConfig(level=logging.INFO)
-app = Flask(__name__)
+import httpx
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
-# =========================
-# ENV
-# =========================
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
 
-# Tu SIP Domain de Twilio
-SIP_DOMAIN = os.getenv("SIP_DOMAIN", "nuxway.sip.twilio.com").strip()
+# -----------------------------
+# ENV VARS (Heroku/Render/etc.)
+# -----------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-# Cola/extensión destino
-QUEUE_EXT = os.getenv("QUEUE_EXT", "6049").strip()
+ELEVEN_SHARED_SECRET = os.getenv("ELEVEN_SHARED_SECRET")  # opcional
 
-# URL pública del servicio (Render)
-BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
+PBX_DOMAIN = os.getenv("PBX_DOMAIN")  # ej: tu-dominio.yeastarcloud.com
+YEASTAR_API_PATH = os.getenv("YEASTAR_API_PATH", "openapi/v1.0")
+YEASTAR_USER_AGENT = os.getenv("YEASTAR_USER_AGENT", "OpenAPI")  # requerido por Yeastar
 
-# Caller SIP
-TWILIO_FROM = os.getenv(
-    "TWILIO_FROM",
-    f"sip:ivr@{SIP_DOMAIN}"
-).strip()
+YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")  # Client ID
+YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")  # Client Secret
 
-# (Opcional) token simple para proteger el webhook
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
+DEFAULT_CALLER = os.getenv("DEFAULT_CALLER", "")  # ej: "100"
+DEFAULT_DIAL_PERMISSION = os.getenv("DEFAULT_DIAL_PERMISSION")  # opcional
+DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")  # yes/no
 
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-def abs_url(path: str) -> str:
-    if not BASE_URL:
-        raise RuntimeError("Falta BASE_URL en variables de entorno")
-    if not path.startswith("/"):
-        path = "/" + path
-    return f"{BASE_URL}{path}"
+def _require_env(name: str, value: Optional[str]) -> str:
+    if not value:
+        raise RuntimeError(f"Missing required env var: {name}")
+    return value
 
-@app.get("/")
-def health():
-    return "OK", 200
 
-# =========================
-# Webhook desde ElevenLabs
-# =========================
-@app.post("/elevenlabs/handoff")
-def elevenlabs_handoff():
+# -----------------------------
+# Helpers
+# -----------------------------
+def normalize_phone(value: str) -> str:
+    """
+    WhatsApp ID puede venir como:
+      - +59170123456
+      - 59170123456
+      - 59170123456@c.us
+    Dejamos solo dígitos y + inicial si existe.
+    """
+    value = value.strip()
+    value = value.replace("@c.us", "").replace("@s.whatsapp.net", "")
+    if value.startswith("+"):
+        return "+" + re.sub(r"\D", "", value)
+    return re.sub(r"\D", "", value)
 
+
+# -----------------------------
+# Yeastar API Client (minimal)
+# -----------------------------
+class YeastarClient:
+    def __init__(self) -> None:
+        self._token: Optional[str] = None
+        self._token_expiry: float = 0.0
+
+    @property
+    def base_url(self) -> str:
+        domain = _require_env("PBX_DOMAIN", PBX_DOMAIN)
+        return f"https://{domain}"
+
+    @property
+    def api_base(self) -> str:
+        return f"{self.base_url}/{YEASTAR_API_PATH}"
+
+    async def get_token(self) -> str:
+        # token endpoint: POST /openapi/v1.0/get_token
+        url = f"{self.api_base}/get_token"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": YEASTAR_USER_AGENT,  # REQUIRED
+        }
+        payload = {
+            "username": _require_env("YEASTAR_USERNAME", YEASTAR_USERNAME),
+            "password": _require_env("YEASTAR_PASSWORD", YEASTAR_PASSWORD),
+        }
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            data = r.json()
+
+        if data.get("errcode") != 0:
+            raise RuntimeError(f"Yeastar get_token failed: {data}")
+
+        token = data["access_token"]
+        expires_in = int(data.get("access_token_expire_time", 1800))
+        self._token = token
+        self._token_expiry = time.time() + max(0, expires_in - 30)  # refresh early
+        return token
+
+    async def access_token(self) -> str:
+        if self._token and time.time() < self._token_expiry:
+            return self._token
+        return await self.get_token()
+
+    async def dial(self, caller: str, callee: str, dial_permission: Optional[str], auto_answer: str) -> Dict[str, Any]:
+        token = await self.access_token()
+
+        url = f"{self.api_base}/call/dial"
+        params = {"access_token": token}
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": YEASTAR_USER_AGENT,
+        }
+
+        payload: Dict[str, Any] = {"caller": caller, "callee": callee}
+        if dial_permission:
+            payload["dial_permission"] = dial_permission
+        if auto_answer:
+            payload["auto_answer"] = auto_answer
+
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, headers=headers, params=params, json=payload)
+            r.raise_for_status()
+            return r.json()
+
+
+yeastar = YeastarClient()
+app = FastAPI(title="eleven-handoff")
+
+
+# -----------------------------
+# Payload que manda ElevenLabs
+# -----------------------------
+class HandoffPayload(BaseModel):
+    whatsapp_id: str = Field(..., description="Número/ID del usuario (ideal E.164 o wa_id).")
+    confirmed: bool = Field(..., description="True si el usuario confirmó hablar con humano.")
+    caller: Optional[str] = Field(None, description="Extensión/Caller. Si no, usa DEFAULT_CALLER.")
+    dial_permission: Optional[str] = Field(None, description="Opcional si caller no tiene permisos.")
+    auto_answer: Optional[str] = Field(None, description="yes/no. Si no, usa DEFAULT_AUTO_ANSWER.")
+
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+
+@app.post("/tools/handoff_to_human")
+async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[str] = Header(default=None)):
     # Seguridad opcional
-    if WEBHOOK_TOKEN:
-        token = request.headers.get("X-Webhook-Token", "").strip()
-        if token != WEBHOOK_TOKEN:
-            return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if ELEVEN_SHARED_SECRET:
+        if not x_eleven_secret or x_eleven_secret != ELEVEN_SHARED_SECRET:
+            raise HTTPException(status_code=401, detail="Invalid secret")
 
-    data = request.get_json(silent=True) or {}
-    logging.info(f"[ELEVENLABS] payload={data}")
+    # Debe venir confirmado (tu agente pregunta primero)
+    if not payload.confirmed:
+        return {"status": "ignored", "reason": "User not confirmed yet"}
 
-    to_sip = f"sip:{QUEUE_EXT}@{SIP_DOMAIN}"
+    caller = payload.caller or DEFAULT_CALLER
+    if not caller:
+        raise HTTPException(status_code=500, detail="DEFAULT_CALLER not set and caller not provided")
+
+    callee = normalize_phone(payload.whatsapp_id)
+    if not callee:
+        raise HTTPException(status_code=400, detail="Invalid whatsapp_id")
+
+    dial_permission = payload.dial_permission or DEFAULT_DIAL_PERMISSION
+    auto_answer = payload.auto_answer or DEFAULT_AUTO_ANSWER
 
     try:
-        call = twilio_client.calls.create(
-            to=to_sip,
-            from_=TWILIO_FROM,
-            url=abs_url("/twiml/notify"),
-            method="POST"
+        res = await yeastar.dial(
+            caller=caller,
+            callee=callee,
+            dial_permission=dial_permission,
+            auto_answer=auto_answer,
         )
-
-        logging.warning(f"[TWILIO] call created SID={call.sid}")
-        return jsonify({"ok": True, "call_sid": call.sid}), 200
-
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"HTTP error calling Yeastar: {str(e)}")
     except Exception as e:
-        logging.exception("[TWILIO] error creating call")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        raise HTTPException(status_code=502, detail=f"Error calling Yeastar: {str(e)}")
 
-# =========================
-# TwiML mínimo
-# =========================
-@app.post("/twiml/notify")
-def twiml_notify():
-    vr = VoiceResponse()
-    vr.say("Conectando con soporte. Por favor espere.", language="es-MX")
-    return Response(str(vr), mimetype="text/xml")
+    if res.get("errcode") != 0:
+        raise HTTPException(status_code=502, detail={"yeastar": res})
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    return {"status": "ok", "call_id": res.get("call_id"), "yeastar": res}
 
