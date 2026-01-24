@@ -1,6 +1,7 @@
 import os
 import time
 import re
+import json
 import logging
 from typing import Optional, Any, Dict
 
@@ -28,19 +29,21 @@ YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")
 YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")
 
 # Control variables
-CALLER = os.getenv("CALLER", "6200")  # IVR 6200 or queue/ivr entry
-CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")  # outbound prefix (your PBX)
+CALLER = os.getenv("CALLER", "6200")                 # IVR 6200 or queue/ivr entry
+CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")     # outbound prefix (your PBX)
 DIAL_PERMISSION = os.getenv("DIAL_PERMISSION", "4002")  # permission extension
-
 DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")  # keep 'no' for IVR/Queue flow
 
-# Country-code stripping
+# If STRIP_COUNTRY_CODE=1, keep ONLY the last LOCAL_NUMBER_LEN digits.
+# Example: 59161786583 -> last 8 digits -> 61786583
 STRIP_COUNTRY_CODE = os.getenv("STRIP_COUNTRY_CODE", "1") == "1"
-LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))
+LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))  # Bolivia local is usually 8
 
-# ✅ Zoho Flow (NEW)
+# -----------------------------
+# NEW: Zoho Flow Webhook (Bigin)
+# -----------------------------
 ZOHO_FLOW_WEBHOOK_URL = os.getenv("ZOHO_FLOW_WEBHOOK_URL", "")
-ZOHO_ENABLED = os.getenv("ZOHO_ENABLED", "1") == "1"
+ZOHO_SOURCE = os.getenv("ZOHO_SOURCE", "elevenlabs-handoff")  # optional label
 
 
 def _require_env(name: str, value: Optional[str]) -> str:
@@ -49,6 +52,9 @@ def _require_env(name: str, value: Optional[str]) -> str:
     return value
 
 
+# -----------------------------
+# Helpers: phone normalization
+# -----------------------------
 def normalize_digits(value: str) -> str:
     """
     Accept:
@@ -56,6 +62,7 @@ def normalize_digits(value: str) -> str:
       - 59161786583
       - 61786583
       - 61786583@c.us
+      - 59161786583@s.whatsapp.net
     Returns only digits.
     """
     value = (value or "").strip()
@@ -65,8 +72,9 @@ def normalize_digits(value: str) -> str:
 
 def to_local_digits(digits: str) -> str:
     """
-    If STRIP_COUNTRY_CODE enabled and digits longer than LOCAL_NUMBER_LEN,
-    keep last LOCAL_NUMBER_LEN digits.
+    Global approach:
+    If STRIP_COUNTRY_CODE is enabled and digits is longer than LOCAL_NUMBER_LEN,
+    keep the last LOCAL_NUMBER_LEN digits.
     """
     if not digits:
         return ""
@@ -77,10 +85,10 @@ def to_local_digits(digits: str) -> str:
 
 def build_callee(number: str) -> str:
     """
-    PBX dial string:
-      - normalize digits
-      - strip country code (last N digits)
-      - add CALLEE_PREFIX (98)
+    Build final PBX dial string:
+      - normalize to digits
+      - convert to local digits (strip country code by taking last N)
+      - add CALLEE_PREFIX (98) unless already present
     """
     digits = normalize_digits(number)
     prefix = normalize_digits(CALLEE_PREFIX)
@@ -88,7 +96,8 @@ def build_callee(number: str) -> str:
     if not digits:
         return ""
 
-    # avoid double prefix
+    # If the incoming number already contains the PBX prefix, remove it temporarily,
+    # then re-apply it at the end (avoid weird double prefix cases).
     if prefix and digits.startswith(prefix) and len(digits) > len(prefix):
         digits_wo_prefix = digits[len(prefix):]
     else:
@@ -104,26 +113,8 @@ def build_callee(number: str) -> str:
 
 
 # -----------------------------
-# ✅ Zoho sender (NEW)
+# Yeastar Client
 # -----------------------------
-async def send_to_zoho_flow(payload: Dict[str, Any]) -> bool:
-    """
-    Sends payload to Zoho Flow webhook.
-    """
-    if not (ZOHO_ENABLED and ZOHO_FLOW_WEBHOOK_URL):
-        logger.info("Zoho disabled or missing ZOHO_FLOW_WEBHOOK_URL -> skipping.")
-        return False
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.post(ZOHO_FLOW_WEBHOOK_URL, json=payload)
-        logger.info(f"Zoho Flow status={r.status_code} body={r.text[:300]}")
-        return 200 <= r.status_code < 300
-    except Exception as e:
-        logger.exception(f"Zoho Flow error: {e}")
-        return False
-
-
 class YeastarClient:
     def __init__(self) -> None:
         self._token: Optional[str] = None
@@ -169,9 +160,14 @@ class YeastarClient:
             return self._token
         return await self.get_token()
 
-    async def dial(self, caller: str, callee: str, dial_permission: Optional[str], auto_answer: str) -> Dict[str, Any]:
+    async def dial(
+        self,
+        caller: str,
+        callee: str,
+        dial_permission: Optional[str],
+        auto_answer: str,
+    ) -> Dict[str, Any]:
         token = await self.access_token()
-
         url = f"{self.api_base}/call/dial"
         params = {"access_token": token}
         headers = {"Content-Type": "application/json", "User-Agent": YEASTAR_USER_AGENT}
@@ -194,26 +190,46 @@ app = FastAPI(title="eleven-handoff")
 
 
 # -----------------------------
-# Payload (tolerant)
+# Payloads
 # -----------------------------
 class HandoffPayload(BaseModel):
     whatsapp_id: Optional[str] = Field(None, description="WhatsApp user id / phone number")
     confirmed: Optional[bool] = Field(None, description="True after user confirms")
     reason: Optional[str] = Field(None, description="Optional context.")
-
-    # ✅ NEW fields from ElevenLabs tool (for Zoho)
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    email: Optional[str] = None
-    city: Optional[str] = None
-    alt_phone: Optional[str] = None
-
     # Optional overrides per request
     caller: Optional[str] = None
     dial_permission: Optional[str] = None
     auto_answer: Optional[str] = None
 
 
+class ZohoLeadPayload(BaseModel):
+    """
+    Endpoint SOLO para registrar lead en Zoho Flow / Bigin.
+    NO dispara llamada.
+    """
+    whatsapp_id: Optional[str] = Field(None, description="WhatsApp user id / phone number")
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    name: Optional[str] = None          # full name (si no hay first/last)
+    city: Optional[str] = None
+    phone: Optional[str] = None         # puede venir con +código país o local
+    email: Optional[str] = None
+    company_name: Optional[str] = None
+    reason: Optional[str] = None
+
+    # banderas
+    human_requested: Optional[bool] = None
+    callback_requested: Optional[bool] = None
+
+    # extra
+    notes: Optional[str] = None
+    last_intent: Optional[str] = None
+    source: Optional[str] = None        # si quieres sobreescribir ZOHO_SOURCE
+
+
+# -----------------------------
+# Health
+# -----------------------------
 @app.get("/health")
 async def health():
     return {
@@ -225,8 +241,8 @@ async def health():
         "dial_permission": DIAL_PERMISSION,
         "strip_country_code": STRIP_COUNTRY_CODE,
         "local_number_len": LOCAL_NUMBER_LEN,
-        "zoho_enabled": ZOHO_ENABLED,
         "zoho_configured": bool(ZOHO_FLOW_WEBHOOK_URL),
+        "zoho_source": ZOHO_SOURCE,
     }
 
 
@@ -239,6 +255,82 @@ async def yeastar_ping(x_admin_key: Optional[str] = Header(default=None)):
     return {"ok": True, "message": "Yeastar token obtained", "token_prefix": token[:6]}
 
 
+# -----------------------------
+# NEW: Zoho Lead (NO CALL)
+# -----------------------------
+async def send_to_zoho_flow(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not ZOHO_FLOW_WEBHOOK_URL:
+        return {"ok": False, "error": "ZOHO_FLOW_WEBHOOK_URL not configured"}
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(ZOHO_FLOW_WEBHOOK_URL, json=payload)
+        ok = 200 <= r.status_code < 300
+        return {"ok": ok, "status_code": r.status_code, "response_text": r.text[:800]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/tools/zoho_lead")
+async def zoho_lead(payload: ZohoLeadPayload, x_eleven_secret: Optional[str] = Header(default=None)):
+    logger.info(">>> /tools/zoho_lead HIT")
+    logger.info(f"Payload received: {payload.model_dump()}")
+
+    # Optional security (si quieres protegerlo igual)
+    if ELEVEN_SHARED_SECRET and x_eleven_secret != ELEVEN_SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid secret")
+
+    # normaliza
+    wa_digits = normalize_digits(payload.whatsapp_id or "")
+    phone_digits = normalize_digits(payload.phone or "")
+
+    phone_local = to_local_digits(phone_digits) if phone_digits else None
+    wa_local = to_local_digits(wa_digits) if wa_digits else None
+
+    zoho_payload = {
+        "source": payload.source or ZOHO_SOURCE,
+        "ts": int(time.time()),
+        "created_at": int(time.time()),
+
+        # IDs / contacto
+        "wa_id": payload.whatsapp_id,
+        "wa_id_digits": wa_digits or None,
+        "wa_local": wa_local or None,
+
+        "first_name": payload.first_name,
+        "last_name": payload.last_name,
+        "name": payload.name,
+
+        "city": payload.city,
+        "company_name": payload.company_name,
+
+        "phone": payload.phone,
+        "phone_digits": phone_digits or None,
+        "phone_local": phone_local or None,
+
+        "email": payload.email,
+
+        # intenciones
+        "human_requested": bool(payload.human_requested) if payload.human_requested is not None else None,
+        "callback_requested": bool(payload.callback_requested) if payload.callback_requested is not None else None,
+        "last_intent": payload.last_intent,
+        "reason": payload.reason,
+        "notes": payload.notes,
+    }
+
+    res = await send_to_zoho_flow(zoho_payload)
+    logger.info(f"Zoho result: {res}")
+
+    # nunca 422 aquí; siempre devolvemos ok/failed
+    if not res.get("ok"):
+        return {"status": "failed", "detail": res}
+
+    return {"status": "ok", "detail": res}
+
+
+# -----------------------------
+# Existing: Handoff -> Yeastar Call
+# -----------------------------
 @app.post("/tools/handoff_to_human")
 async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[str] = Header(default=None)):
     logger.info(">>> /tools/handoff_to_human HIT")
@@ -249,7 +341,7 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     if ELEVEN_SHARED_SECRET and x_eleven_secret != ELEVEN_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # Tolerant: avoid accidental calls
+    # Tolerant: avoid 422 if ElevenLabs sends partial requests
     if payload.confirmed is not True:
         return {"status": "ignored", "reason": "confirmed is not true"}
 
@@ -260,34 +352,13 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     dial_permission = (payload.dial_permission or DIAL_PERMISSION).strip() if (payload.dial_permission or DIAL_PERMISSION) else None
     auto_answer = (payload.auto_answer or DEFAULT_AUTO_ANSWER).strip()
 
-    # If user provided alt_phone (and you trust it), you can call that instead.
-    # For now we keep DEFAULT behavior: call the whatsapp_id unless alt_phone exists.
-    number_to_call = payload.alt_phone.strip() if payload.alt_phone else payload.whatsapp_id
-
-    callee = build_callee(number_to_call)
+    callee = build_callee(payload.whatsapp_id)
 
     if not caller:
         return {"status": "ignored", "reason": "CALLER not set"}
 
     if not callee:
-        return {"status": "ignored", "reason": "invalid number after normalization"}
-
-    # ✅ Send to Zoho FIRST (so you capture even if PBX fails)
-    zoho_payload = {
-        "source": "elevenlabs-handoff",
-        "ts": int(time.time()),
-        "whatsapp_id": payload.whatsapp_id,
-        "called_number_raw": number_to_call,
-        "callee_pbx": callee,
-        "reason": payload.reason,
-        "first_name": payload.first_name,
-        "last_name": payload.last_name,
-        "email": payload.email,
-        "city": payload.city,
-        "alt_phone": payload.alt_phone,
-        "confirmed": bool(payload.confirmed),
-    }
-    _ = await send_to_zoho_flow(zoho_payload)
+        return {"status": "ignored", "reason": "invalid whatsapp_id after normalization"}
 
     logger.info(
         f"Prepared call -> caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer} "
