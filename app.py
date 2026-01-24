@@ -28,17 +28,19 @@ YEASTAR_USERNAME = os.getenv("YEASTAR_USERNAME")
 YEASTAR_PASSWORD = os.getenv("YEASTAR_PASSWORD")
 
 # Control variables
-CALLER = os.getenv("CALLER", "6200")               # IVR 6200 or queue/ivr entry
-CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")   # outbound prefix (your PBX)
+CALLER = os.getenv("CALLER", "6200")  # IVR 6200 or queue/ivr entry
+CALLEE_PREFIX = os.getenv("CALLEE_PREFIX", "98")  # outbound prefix (your PBX)
 DIAL_PERMISSION = os.getenv("DIAL_PERMISSION", "4002")  # permission extension
 
 DEFAULT_AUTO_ANSWER = os.getenv("DEFAULT_AUTO_ANSWER", "no")  # keep 'no' for IVR/Queue flow
 
-# NEW (global country-code stripping):
-# If STRIP_COUNTRY_CODE=1, we will keep ONLY the last LOCAL_NUMBER_LEN digits.
-# Example: 59161786583 -> last 8 digits -> 61786583
+# Country-code stripping
 STRIP_COUNTRY_CODE = os.getenv("STRIP_COUNTRY_CODE", "1") == "1"
-LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))  # Bolivia local is usually 8
+LOCAL_NUMBER_LEN = int(os.getenv("LOCAL_NUMBER_LEN", "8"))
+
+# ✅ Zoho Flow (NEW)
+ZOHO_FLOW_WEBHOOK_URL = os.getenv("ZOHO_FLOW_WEBHOOK_URL", "")
+ZOHO_ENABLED = os.getenv("ZOHO_ENABLED", "1") == "1"
 
 
 def _require_env(name: str, value: Optional[str]) -> str:
@@ -63,11 +65,8 @@ def normalize_digits(value: str) -> str:
 
 def to_local_digits(digits: str) -> str:
     """
-    Global approach:
-    If STRIP_COUNTRY_CODE is enabled and digits is longer than LOCAL_NUMBER_LEN,
-    keep the last LOCAL_NUMBER_LEN digits.
-
-    This works for most cases when your PBX dial plan expects a fixed local length.
+    If STRIP_COUNTRY_CODE enabled and digits longer than LOCAL_NUMBER_LEN,
+    keep last LOCAL_NUMBER_LEN digits.
     """
     if not digits:
         return ""
@@ -78,10 +77,10 @@ def to_local_digits(digits: str) -> str:
 
 def build_callee(number: str) -> str:
     """
-    Build final PBX dial string:
-      - normalize to digits
-      - convert to local digits (strip country code by taking last N)
-      - add CALLEE_PREFIX (98) unless already present
+    PBX dial string:
+      - normalize digits
+      - strip country code (last N digits)
+      - add CALLEE_PREFIX (98)
     """
     digits = normalize_digits(number)
     prefix = normalize_digits(CALLEE_PREFIX)
@@ -89,8 +88,7 @@ def build_callee(number: str) -> str:
     if not digits:
         return ""
 
-    # If the incoming number already contains the PBX prefix, remove it temporarily,
-    # then re-apply it at the end (avoid weird double prefix cases).
+    # avoid double prefix
     if prefix and digits.startswith(prefix) and len(digits) > len(prefix):
         digits_wo_prefix = digits[len(prefix):]
     else:
@@ -103,6 +101,27 @@ def build_callee(number: str) -> str:
     if prefix:
         return f"{prefix}{local_digits}"
     return local_digits
+
+
+# -----------------------------
+# ✅ Zoho sender (NEW)
+# -----------------------------
+async def send_to_zoho_flow(payload: Dict[str, Any]) -> bool:
+    """
+    Sends payload to Zoho Flow webhook.
+    """
+    if not (ZOHO_ENABLED and ZOHO_FLOW_WEBHOOK_URL):
+        logger.info("Zoho disabled or missing ZOHO_FLOW_WEBHOOK_URL -> skipping.")
+        return False
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(ZOHO_FLOW_WEBHOOK_URL, json=payload)
+        logger.info(f"Zoho Flow status={r.status_code} body={r.text[:300]}")
+        return 200 <= r.status_code < 300
+    except Exception as e:
+        logger.exception(f"Zoho Flow error: {e}")
+        return False
 
 
 class YeastarClient:
@@ -121,10 +140,7 @@ class YeastarClient:
 
     async def get_token(self) -> str:
         url = f"{self.api_base}/get_token"
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": YEASTAR_USER_AGENT,
-        }
+        headers = {"Content-Type": "application/json", "User-Agent": YEASTAR_USER_AGENT}
         payload = {
             "username": _require_env("YEASTAR_USERNAME", YEASTAR_USERNAME),
             "password": _require_env("YEASTAR_PASSWORD", YEASTAR_PASSWORD),
@@ -153,21 +169,12 @@ class YeastarClient:
             return self._token
         return await self.get_token()
 
-    async def dial(
-        self,
-        caller: str,
-        callee: str,
-        dial_permission: Optional[str],
-        auto_answer: str,
-    ) -> Dict[str, Any]:
+    async def dial(self, caller: str, callee: str, dial_permission: Optional[str], auto_answer: str) -> Dict[str, Any]:
         token = await self.access_token()
 
         url = f"{self.api_base}/call/dial"
         params = {"access_token": token}
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": YEASTAR_USER_AGENT,
-        }
+        headers = {"Content-Type": "application/json", "User-Agent": YEASTAR_USER_AGENT}
 
         payload: Dict[str, Any] = {"caller": caller, "callee": callee}
         if dial_permission:
@@ -187,12 +194,19 @@ app = FastAPI(title="eleven-handoff")
 
 
 # -----------------------------
-# Payload (tolerant to avoid 422)
+# Payload (tolerant)
 # -----------------------------
 class HandoffPayload(BaseModel):
     whatsapp_id: Optional[str] = Field(None, description="WhatsApp user id / phone number")
     confirmed: Optional[bool] = Field(None, description="True after user confirms")
     reason: Optional[str] = Field(None, description="Optional context.")
+
+    # ✅ NEW fields from ElevenLabs tool (for Zoho)
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    email: Optional[str] = None
+    city: Optional[str] = None
+    alt_phone: Optional[str] = None
 
     # Optional overrides per request
     caller: Optional[str] = None
@@ -211,6 +225,8 @@ async def health():
         "dial_permission": DIAL_PERMISSION,
         "strip_country_code": STRIP_COUNTRY_CODE,
         "local_number_len": LOCAL_NUMBER_LEN,
+        "zoho_enabled": ZOHO_ENABLED,
+        "zoho_configured": bool(ZOHO_FLOW_WEBHOOK_URL),
     }
 
 
@@ -233,7 +249,7 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     if ELEVEN_SHARED_SECRET and x_eleven_secret != ELEVEN_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="Invalid secret")
 
-    # Tolerant: avoid 422 if ElevenLabs sends partial requests
+    # Tolerant: avoid accidental calls
     if payload.confirmed is not True:
         return {"status": "ignored", "reason": "confirmed is not true"}
 
@@ -244,13 +260,34 @@ async def handoff_to_human(payload: HandoffPayload, x_eleven_secret: Optional[st
     dial_permission = (payload.dial_permission or DIAL_PERMISSION).strip() if (payload.dial_permission or DIAL_PERMISSION) else None
     auto_answer = (payload.auto_answer or DEFAULT_AUTO_ANSWER).strip()
 
-    callee = build_callee(payload.whatsapp_id)
+    # If user provided alt_phone (and you trust it), you can call that instead.
+    # For now we keep DEFAULT behavior: call the whatsapp_id unless alt_phone exists.
+    number_to_call = payload.alt_phone.strip() if payload.alt_phone else payload.whatsapp_id
+
+    callee = build_callee(number_to_call)
 
     if not caller:
         return {"status": "ignored", "reason": "CALLER not set"}
 
     if not callee:
-        return {"status": "ignored", "reason": "invalid whatsapp_id after normalization"}
+        return {"status": "ignored", "reason": "invalid number after normalization"}
+
+    # ✅ Send to Zoho FIRST (so you capture even if PBX fails)
+    zoho_payload = {
+        "source": "elevenlabs-handoff",
+        "ts": int(time.time()),
+        "whatsapp_id": payload.whatsapp_id,
+        "called_number_raw": number_to_call,
+        "callee_pbx": callee,
+        "reason": payload.reason,
+        "first_name": payload.first_name,
+        "last_name": payload.last_name,
+        "email": payload.email,
+        "city": payload.city,
+        "alt_phone": payload.alt_phone,
+        "confirmed": bool(payload.confirmed),
+    }
+    _ = await send_to_zoho_flow(zoho_payload)
 
     logger.info(
         f"Prepared call -> caller={caller}, callee={callee}, dial_permission={dial_permission}, auto_answer={auto_answer} "
